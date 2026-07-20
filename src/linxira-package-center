@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CATALOG_PATH="${LINXIRA_CATALOG_PATH:-/usr/share/linxira/catalog/catalog-v2.json}"
+COMPONENTS_CLI="${LINXIRA_COMPONENTS_CLI:-/usr/bin/linxira-components}"
+
+command -v kdialog >/dev/null || { printf '%s\n' 'kdialog is required.' >&2; exit 1; }
+command -v jq >/dev/null || { kdialog --error 'jq is required to read the Linxira catalog.'; exit 1; }
+[[ -r "$CATALOG_PATH" ]] || { kdialog --error "Catalog not found: $CATALOG_PATH"; exit 1; }
+[[ -x "$COMPONENTS_CLI" ]] || { kdialog --error "Transaction backend not found: $COMPONENTS_CLI"; exit 1; }
+
+mapfile -t entries < <(jq -r '
+    (.categories | map({key: .id, value: .name.zh_CN}) | from_entries) as $names
+    | .applications[]
+    | select(.installer == true and .review.status == "reviewed")
+    | [(.categories | map($names[.]) | join(" / ")), .id, .name.zh_CN, .description.zh_CN, (.presentation.defaultSelected // false)]
+    | @tsv
+' "$CATALOG_PATH")
+if [[ ${#entries[@]} -eq 0 ]]; then
+    kdialog --error 'The Linxira catalog contains no reviewed applications.'
+    exit 1
+fi
+
+choices=()
+for entry in "${entries[@]}"; do
+    IFS=$'\t' read -r category id name description default_selected <<<"$entry"
+    state=off
+    [[ $default_selected == true ]] && state=on
+    choices+=("$id" "[$category] $name - $description" "$state")
+done
+
+selected=$(kdialog --title 'Linxira Package Center' --checklist '选择要安装的应用：' "${choices[@]}" 2>/dev/null) || exit 0
+selected=${selected//\"/}
+[[ -n "$selected" ]] || exit 0
+read -r -a applications <<<"$selected"
+
+summary=$(printf '%s\n' "${applications[@]}" | paste -sd ', ' -)
+kdialog --warningyesno "将安装以下应用：\n\n$summary\n\n需要管理员授权，是否继续？" || exit 0
+transaction_dir=$(mktemp -d)
+trap 'rm -rf -- "$transaction_dir"' EXIT
+plan_args=()
+for application in "${applications[@]}"; do
+    plan_args+=(--application "$application")
+done
+if ! output=$("$COMPONENTS_CLI" plan --catalog "$CATALOG_PATH" \
+    --output-dir "$transaction_dir" "${plan_args[@]}" 2>&1); then
+    kdialog --title '安装失败' --error "$output"
+    exit 1
+fi
+if ! output=$("$COMPONENTS_CLI" confirm --catalog "$CATALOG_PATH" \
+    --plan "$transaction_dir/request-plan.json" --output-dir "$transaction_dir" 2>&1); then
+    kdialog --title '安装失败' --error "$output"
+    exit 1
+fi
+if ! output=$(pkexec "$COMPONENTS_CLI" apply \
+    --confirmation "$transaction_dir/confirmation.json" 2>&1); then
+    kdialog --title '安装失败' --error "$output"
+    exit 1
+fi
+kdialog --title '安装完成' --msgbox "$output"
