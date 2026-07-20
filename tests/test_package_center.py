@@ -10,9 +10,13 @@ import unittest
 ROOT = Path(__file__).parents[1]
 CLIENT = ROOT / "src/linxira-package-center"
 DESKTOP = ROOT / "data/org.linxira.PackageCenter.desktop"
+VERSION = ROOT / "VERSION"
 
 
 class PackageCenterTests(unittest.TestCase):
+    def test_source_version_is_declared(self) -> None:
+        self.assertEqual(VERSION.read_text(encoding="utf-8"), "0.1.0\n")
+
     def test_client_uses_catalog_bound_backend_transaction(self) -> None:
         script = CLIENT.read_text(encoding="utf-8")
         self.assertIn("catalog-v2.json", script)
