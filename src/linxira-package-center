@@ -1,61 +1,807 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 
-set -euo pipefail
+from __future__ import annotations
 
-CATALOG_PATH="${LINXIRA_CATALOG_PATH:-/usr/share/linxira/catalog/catalog-v2.json}"
-COMPONENTS_CLI="${LINXIRA_COMPONENTS_CLI:-/usr/bin/linxira-components}"
+import json
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from typing import Any, Iterable
 
-command -v kdialog >/dev/null || { printf '%s\n' 'kdialog is required.' >&2; exit 1; }
-command -v jq >/dev/null || { kdialog --error 'jq is required to read the Linxira catalog.'; exit 1; }
-[[ -r "$CATALOG_PATH" ]] || { kdialog --error "Catalog not found: $CATALOG_PATH"; exit 1; }
-[[ -x "$COMPONENTS_CLI" ]] || { kdialog --error "Transaction backend not found: $COMPONENTS_CLI"; exit 1; }
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
-mapfile -t entries < <(jq -r '
-    (.categories | map({key: .id, value: .name.zh_CN}) | from_entries) as $names
-    | .applications[]
-    | select(.installer == true and .review.status == "reviewed")
-    | [(.categories | map($names[.]) | join(" / ")), .id, .name.zh_CN, .description.zh_CN, (.presentation.defaultSelected // false)]
-    | @tsv
-' "$CATALOG_PATH")
-if [[ ${#entries[@]} -eq 0 ]]; then
-    kdialog --error 'The Linxira catalog contains no reviewed applications.'
-    exit 1
-fi
 
-choices=()
-for entry in "${entries[@]}"; do
-    IFS=$'\t' read -r category id name description default_selected <<<"$entry"
-    state=off
-    [[ $default_selected == true ]] && state=on
-    choices+=("$id" "[$category] $name - $description" "$state")
-done
+DEFAULT_CATALOG_PATH = "/usr/share/linxira/catalog/catalog-v3.json"
+DEFAULT_COMPONENTS_CLI = "/usr/bin/linxira-components"
+APPLICATION_ID = re.compile(r"^[a-z0-9-]+$")
+APP_ROLE = Qt.ItemDataRole.UserRole
+CATEGORY_ROLE = Qt.ItemDataRole.UserRole + 1
 
-selected=$(kdialog --title 'Linxira Package Center' --checklist '选择要安装的应用：' "${choices[@]}" 2>/dev/null) || exit 0
-selected=${selected//\"/}
-[[ -n "$selected" ]] || exit 0
-read -r -a applications <<<"$selected"
 
-summary=$(printf '%s\n' "${applications[@]}" | paste -sd ', ' -)
-kdialog --warningyesno "将安装以下应用：\n\n$summary\n\n需要管理员授权，是否继续？" || exit 0
-transaction_dir=$(mktemp -d)
-trap 'rm -rf -- "$transaction_dir"' EXIT
-plan_args=()
-for application in "${applications[@]}"; do
-    plan_args+=(--application "$application")
-done
-if ! output=$("$COMPONENTS_CLI" plan --catalog "$CATALOG_PATH" \
-    --output-dir "$transaction_dir" "${plan_args[@]}" 2>&1); then
-    kdialog --title '安装失败' --error "$output"
-    exit 1
-fi
-if ! output=$("$COMPONENTS_CLI" confirm --catalog "$CATALOG_PATH" \
-    --plan "$transaction_dir/request-plan.json" --output-dir "$transaction_dir" 2>&1); then
-    kdialog --title '安装失败' --error "$output"
-    exit 1
-fi
-if ! output=$(pkexec "$COMPONENTS_CLI" apply \
-    --confirmation "$transaction_dir/confirmation.json" 2>&1); then
-    kdialog --title '安装失败' --error "$output"
-    exit 1
-fi
-kdialog --title '安装完成' --msgbox "$output"
+class CatalogError(ValueError):
+    pass
+
+
+def localized(value: object, fallback: str) -> str:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        for language in ("zh_CN", "en"):
+            text = value.get(language)
+            if isinstance(text, str) and text:
+                return text
+        for text in value.values():
+            if isinstance(text, str) and text:
+                return text
+    return fallback
+
+
+@dataclass(frozen=True)
+class ApplicationEntry:
+    id: str
+    name: str
+    description: str
+    primary_category: str
+    default_selected: bool
+    recommended: bool
+    order: int
+    installed: bool
+    source: str
+    license: str
+    provider: str
+    review_status: str
+    channel: str
+    availability_reason: str
+    user_opt_in_required: bool
+
+    @property
+    def selectable(self) -> bool:
+        return self.channel == "default"
+
+
+@dataclass(frozen=True)
+class CategoryEntry:
+    id: str
+    name: str
+    mode: str
+    max_selected: int | None
+    order: int
+    applications: tuple[ApplicationEntry, ...]
+
+
+def _selection_policy(category: dict[str, Any]) -> tuple[str, int | None]:
+    selection = category.get("selection", category.get("selectionPolicy", "multi"))
+    if isinstance(selection, str):
+        mode = selection
+        maximum = category.get("maxSelected")
+    elif isinstance(selection, dict):
+        mode = selection.get("mode", selection.get("type", "multi"))
+        maximum = selection.get("maxSelected", category.get("maxSelected"))
+    else:
+        mode, maximum = "multi", None
+    if mode not in {"multi", "exclusive", "bounded"}:
+        mode, maximum = "multi", None
+    if mode == "exclusive":
+        return mode, 1
+    if mode == "bounded":
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+            raise CatalogError(f"Category {category.get('id', '<unknown>')} has invalid maxSelected")
+        return mode, maximum
+    return mode, None
+
+
+def _installed_ids(document: object) -> set[str]:
+    if isinstance(document, list):
+        return {value for value in document if isinstance(value, str) and APPLICATION_ID.fullmatch(value)}
+    if not isinstance(document, dict):
+        return set()
+    direct = document.get("installedApplications", document.get("installed", []))
+    result = _installed_ids(direct) if isinstance(direct, list) else set()
+    applications = document.get("applications", {})
+    if isinstance(applications, dict):
+        for application_id, state in applications.items():
+            if not isinstance(application_id, str) or not APPLICATION_ID.fullmatch(application_id):
+                continue
+            if isinstance(state, str):
+                status = state
+            elif isinstance(state, dict):
+                status = state.get("state", state.get("status", ""))
+            else:
+                status = ""
+            if isinstance(status, str) and (status.startswith("installed") or status in {"managed", "observed"}):
+                result.add(application_id)
+    return result
+
+
+def load_installed_state(path: Path | None) -> set[str]:
+    if path is None or not path.is_file():
+        return set()
+    try:
+        return _installed_ids(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def load_catalog(path: Path, installed_ids: Iterable[str] = ()) -> tuple[CategoryEntry, ...]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CatalogError(f"无法读取软件目录：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise CatalogError(f"软件目录不是有效 JSON：{exc}") from exc
+    if not isinstance(document, dict) or not isinstance(document.get("applications"), list):
+        raise CatalogError("软件目录缺少 applications 数组")
+
+    version = document.get("catalogVersion", 2)
+    if version not in {2, 3} or isinstance(version, bool):
+        raise CatalogError(f"不支持的软件目录版本：{version!r}")
+    raw_categories = document.get("categories", [])
+    category_documents = {
+        value["id"]: value
+        for value in raw_categories
+        if isinstance(value, dict) and isinstance(value.get("id"), str)
+    } if isinstance(raw_categories, list) else {}
+    installed = set(installed_ids)
+    grouped: dict[str, list[ApplicationEntry]] = {}
+    raw_applications: dict[str, dict[str, Any]] = {}
+
+    for raw in document["applications"]:
+        if not isinstance(raw, dict):
+            continue
+        application_id = raw.get("id")
+        if not isinstance(application_id, str) or not APPLICATION_ID.fullmatch(application_id):
+            raise CatalogError(f"软件目录包含不安全的 application ID：{application_id!r}")
+        raw_applications[application_id] = raw
+
+    sources = {
+        value["id"]: value for value in document.get("sources", [])
+        if isinstance(value, dict) and isinstance(value.get("id"), str)
+    }
+
+    def add_application(raw: dict[str, Any], primary: str) -> None:
+        application_id = raw["id"]
+        review = raw.get("review", {})
+        review_status = review.get("status", "") if isinstance(review, dict) else ""
+        availability = raw.get("availability", {})
+        if not isinstance(availability, dict):
+            availability = {}
+        status = availability.get("status", "available")
+        channel = availability.get("channel", "default")
+        provider = str(raw.get("provider", "pacman"))
+        source = str(raw.get("source", "-"))
+        if version == 2:
+            if raw.get("installer") is not True or review_status != "reviewed":
+                return
+            channel = "default"
+        elif channel == "default":
+            if review_status != "reviewed" or status != "available" or provider != "pacman" or source != "arch":
+                return
+        elif channel == "optional-review":
+            if status != "review-channel":
+                return
+        else:
+            return
+        presentation = raw.get("presentation", {})
+        if not isinstance(presentation, dict):
+            presentation = {}
+        license_value = raw.get("license")
+        if isinstance(license_value, dict):
+            license_text = str(license_value.get("spdx", license_value.get("classification", "未提供")))
+            if license_value.get("requiresAcceptance") is True:
+                license_text += "（需要接受许可）"
+        else:
+            license_text = localized(license_value, "未提供")
+        source_document = sources.get(source, {})
+        entry = ApplicationEntry(
+            id=application_id,
+            name=localized(raw.get("name"), application_id),
+            description=localized(raw.get("description"), "暂无说明。"),
+            primary_category=primary,
+            default_selected=bool(presentation.get("defaultSelected", raw.get("defaultSelected", False))),
+            recommended=bool(presentation.get("recommended", raw.get("recommended", False))),
+            order=presentation.get("order", raw.get("order", 0)) if isinstance(presentation.get("order", raw.get("order", 0)), int) else 0,
+            installed=application_id in installed,
+            source=source,
+            license=license_text,
+            provider=provider,
+            review_status=review_status,
+            channel=str(channel),
+            availability_reason=str(availability.get("reason", "")),
+            user_opt_in_required=channel == "optional-review" or bool(source_document.get("userOptInRequired", False)),
+        )
+        grouped.setdefault(primary, []).append(entry)
+
+    if version == 3:
+        for category in raw_categories if isinstance(raw_categories, list) else []:
+            if not isinstance(category, dict) or category.get("surface") != "applications":
+                continue
+            category_id = category.get("id")
+            children = category.get("children")
+            if not isinstance(category_id, str) or not isinstance(children, list):
+                raise CatalogError("Catalog v3 应用分类缺少合法的 id 或 children")
+            for application_id in children:
+                if not isinstance(application_id, str) or application_id not in raw_applications:
+                    raise CatalogError(f"Catalog v3 分类 {category_id} 引用了未知应用：{application_id!r}")
+                raw = raw_applications[application_id]
+                if raw.get("primaryCategory") != category_id:
+                    continue
+                add_application(raw, category_id)
+    else:
+        for raw in raw_applications.values():
+            application_categories = raw.get("categories", [])
+            primary = raw.get("primaryCategory")
+            if not isinstance(primary, str) or not primary:
+                primary = application_categories[0] if isinstance(application_categories, list) and application_categories else "other"
+            add_application(raw, primary)
+
+    categories: list[CategoryEntry] = []
+    for index, (category_id, applications) in enumerate(grouped.items()):
+        raw = category_documents.get(category_id, {"id": category_id})
+        mode, maximum = _selection_policy(raw)
+        order = raw.get("order", index)
+        categories.append(CategoryEntry(
+            id=category_id,
+            name=localized(raw.get("name"), category_id),
+            mode=mode,
+            max_selected=maximum,
+            order=order if isinstance(order, int) else index,
+            applications=tuple(sorted(applications, key=lambda app: (app.order, app.id))),
+        ))
+    categories.sort(key=lambda category: (category.order, category.id))
+    if not categories:
+        raise CatalogError("软件目录中没有经过审核且可用的应用")
+    return tuple(categories)
+
+
+def _bundle_children(bundle: dict[str, Any]) -> list[tuple[str, str]]:
+    children = bundle.get("children")
+    if isinstance(children, dict):
+        return [
+            (child, role) for role in ("required", "recommended", "optional")
+            for child in children.get(role, []) if isinstance(child, str)
+        ]
+    if isinstance(children, list):
+        return [
+            (child["id"], child["role"]) for child in children
+            if isinstance(child, dict) and isinstance(child.get("id"), str) and isinstance(child.get("role"), str)
+        ]
+    return []
+
+
+def build_v3_selection(document: dict[str, Any], catalog_sha256: str, application_ids: Iterable[str]) -> dict[str, Any]:
+    ids = sorted(set(application_ids))
+    applications = {
+        value["id"]: value for value in document.get("applications", [])
+        if isinstance(value, dict) and isinstance(value.get("id"), str)
+    }
+    categories = {
+        value["id"]: value for value in document.get("categories", [])
+        if isinstance(value, dict) and value.get("surface") == "applications" and isinstance(value.get("id"), str)
+    }
+    bundles = {
+        value["id"]: value for value in document.get("bundles", [])
+        if isinstance(value, dict) and isinstance(value.get("id"), str)
+    }
+    if not ids or any(value not in applications for value in ids):
+        raise RuntimeError("安装请求包含未知 application ID")
+
+    roots: dict[str, list[str]] = {}
+    for application_id in ids:
+        application = applications[application_id]
+        if (
+            application.get("provider") != "pacman"
+            or application.get("source") != "arch"
+            or application.get("review", {}).get("status") != "reviewed"
+            or application.get("availability", {}).get("status") != "available"
+            or application.get("availability", {}).get("channel") != "default"
+        ):
+            raise RuntimeError(f"应用 {application_id} 不属于可安装的 Arch reviewed/default 频道")
+        category_id = application.get("primaryCategory")
+        if category_id not in categories:
+            raise RuntimeError(f"应用 {application_id} 没有合法的 applications category provenance")
+        roots.setdefault(category_id, []).append(application_id)
+
+    override_states: dict[str, bool] = {}
+    for category_id, selected in roots.items():
+        category_children = categories[category_id].get("children", [])
+        refs = _bundle_children(bundles.get(category_id, {}))
+        if (
+            not refs
+            or any(role != "optional" for _, role in refs)
+            or [child for child, _ in refs] != category_children
+            or any(child not in applications for child, _ in refs)
+        ):
+            raise RuntimeError(
+                "当前 linxira-components selection-v1 只接受 bundle 根；"
+                f"Catalog v3 分类 {category_id} 未提供同 ID、全 optional、无隐式依赖的应用 bundle，已安全拒绝计划。"
+            )
+        selected_set = set(selected)
+        for child, _ in refs:
+            override_states[child] = override_states.get(child, False) or child in selected_set
+
+    all_leaf_ids = set(applications)
+    all_leaf_ids.update(
+        value["id"] for collection in ("components", "operations") for value in document.get(collection, [])
+        if isinstance(value, dict) and isinstance(value.get("id"), str)
+    )
+
+    def descendants(node_id: str, visiting: set[str] | None = None) -> set[str]:
+        if node_id in all_leaf_ids:
+            return {node_id}
+        if node_id not in bundles:
+            return set()
+        active = set() if visiting is None else visiting
+        if node_id in active:
+            raise RuntimeError("Catalog v3 bundles 包含循环引用")
+        return set().union(*(descendants(child, active | {node_id}) for child, _ in _bundle_children(bundles[node_id])))
+
+    selected_set = set(ids)
+    constraint_results = []
+    for bundle_id, bundle in bundles.items():
+        chosen = sum(bool(selected_set & descendants(child)) for child, _ in _bundle_children(bundle))
+        selection = bundle.get("selection", "preset")
+        if isinstance(selection, dict):
+            policy = selection.get("mode", selection.get("policy"))
+            maximum = selection.get("maxSelected")
+        else:
+            policy = selection
+            maximum = bundle.get("maxSelected")
+        limit = 1 if policy == "exclusive" else maximum if policy == "bounded" else None
+        constraint_results.append({
+            "bundleId": bundle_id, "policy": policy, "selectedCount": chosen,
+            "maxSelected": limit, "valid": limit is None or chosen <= limit,
+        })
+
+    leaves = [{
+        "id": application_id,
+        "requestedBy": [f"{applications[application_id]['primaryCategory']}/{application_id}"],
+        "provenance": ["optional", "user"],
+    } for application_id in ids]
+    return {
+        "schemaVersion": "org.linxira.component-selection.v1",
+        "catalogSha256": catalog_sha256,
+        "catalogRelease": str(document.get("release", "")),
+        "selectedLeafIds": ids,
+        "selectedBundleIds": sorted(roots),
+        "leaves": leaves,
+        "userOverrides": [
+            {"id": application_id, "selected": selected}
+            for application_id, selected in sorted(override_states.items())
+        ],
+        "constraintResults": sorted(constraint_results, key=lambda value: value["bundleId"]),
+        "providerRequirements": ["pacman"],
+        "sourceRequirements": ["arch"],
+    }
+
+
+class ComponentsBackend:
+    def __init__(self, catalog_path: Path, components_cli: str, pkexec: str = "pkexec") -> None:
+        self.catalog_path = catalog_path
+        self.components_cli = components_cli
+        self.pkexec = pkexec
+
+    @staticmethod
+    def _run(command: list[str]) -> str:
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"找不到事务程序：{command[0]}") from exc
+        except subprocess.CalledProcessError as exc:
+            message = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(message) from exc
+        return (result.stdout or result.stderr).strip()
+
+    def create_plan(self, application_ids: Iterable[str]) -> tuple[Path, dict[str, Any]]:
+        ids = sorted(set(application_ids))
+        if not ids or any(not APPLICATION_ID.fullmatch(value) for value in ids):
+            raise RuntimeError("安装请求没有有效的 application ID")
+        transaction_dir = Path(tempfile.mkdtemp(prefix="linxira-package-center-"))
+        try:
+            raw = self.catalog_path.read_bytes()
+            document = json.loads(raw)
+            command = [self.components_cli, "plan", "--catalog", str(self.catalog_path), "--output-dir", str(transaction_dir)]
+            if isinstance(document, dict) and document.get("catalogVersion") == 3:
+                selection = build_v3_selection(document, hashlib.sha256(raw).hexdigest(), ids)
+                selection_path = transaction_dir / "selection.json"
+                selection_path.write_text(json.dumps(selection, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                command.extend(("--selection", str(selection_path)))
+            else:
+                for application_id in ids:
+                    command.extend(("--application", application_id))
+            self._run(command)
+            plan_path = transaction_dir / "request-plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            if not isinstance(plan, dict):
+                raise RuntimeError("linxira-components 返回了无效计划")
+            return transaction_dir, plan
+        except Exception:
+            shutil.rmtree(transaction_dir, ignore_errors=True)
+            raise
+
+    def confirm_and_apply(self, transaction_dir: Path) -> str:
+        try:
+            self._run([
+                self.components_cli, "confirm", "--catalog", str(self.catalog_path),
+                "--plan", str(transaction_dir / "request-plan.json"), "--output-dir", str(transaction_dir),
+            ])
+            return self._run([
+                self.pkexec, self.components_cli, "apply",
+                "--catalog", str(self.catalog_path),
+                "--confirmation", str(transaction_dir / "confirmation.json"),
+            ])
+        finally:
+            shutil.rmtree(transaction_dir, ignore_errors=True)
+
+
+class ApplyThread(QThread):
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, backend: ComponentsBackend, transaction_dir: Path) -> None:
+        super().__init__()
+        self.backend = backend
+        self.transaction_dir = transaction_dir
+
+    def run(self) -> None:
+        try:
+            self.succeeded.emit(self.backend.confirm_and_apply(self.transaction_dir))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class PlanDialog(QDialog):
+    def __init__(self, names: list[str], plan: dict[str, Any], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("确认安装计划")
+        self.resize(650, 480)
+        layout = QVBoxLayout(self)
+        title = QLabel(f"将安装 {len(names)} 个应用")
+        title.setFont(QFont(title.font().family(), 13, QFont.Weight.DemiBold))
+        layout.addWidget(title)
+        layout.addWidget(QLabel("\n".join(f"• {name}" for name in names)))
+        layout.addWidget(QLabel("以下计划由 linxira-components 生成。确认后将请求管理员授权。"))
+        document = QPlainTextEdit(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+        document.setReadOnly(True)
+        document.setAccessibleName("不可变安装计划")
+        layout.addWidget(document, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并安装")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class PackageCenterWindow(QMainWindow):
+    def __init__(self, categories: tuple[CategoryEntry, ...], backend: ComponentsBackend) -> None:
+        super().__init__()
+        self.categories = categories
+        self.backend = backend
+        self.application_items: dict[str, QTreeWidgetItem] = {}
+        self.category_items: dict[str, QTreeWidgetItem] = {}
+        self._changing = False
+        self.worker: ApplyThread | None = None
+
+        self.setWindowTitle("Linxira 软件中心")
+        self.resize(980, 680)
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(22, 18, 22, 18)
+        self.setCentralWidget(central)
+
+        heading = QLabel("官方推荐软件")
+        heading.setFont(QFont(heading.font().family(), 20, QFont.Weight.DemiBold))
+        root.addWidget(heading)
+        root.addWidget(QLabel("从经过审核的软件目录中选择应用。展开类别可查看和调整每个项目。"))
+
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("显示："))
+        self.filter_box = QComboBox()
+        self.filter_box.addItem("已审核且可安装", "default")
+        self.filter_box.addItem("已安装", "installed")
+        self.filter_box.addItem("第三方审核频道（仅查看，需 opt-in）", "review")
+        self.filter_box.currentIndexChanged.connect(self.apply_filter)
+        toolbar.addWidget(self.filter_box)
+        toolbar.addStretch()
+        root.addLayout(toolbar)
+
+        splitter = QSplitter()
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["软件", "状态"])
+        self.tree.setColumnWidth(0, 390)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setAccessibleName("官方推荐软件选择树")
+        self.tree.itemChanged.connect(self.on_item_changed)
+        self.tree.currentItemChanged.connect(self.show_details)
+        splitter.addWidget(self.tree)
+
+        detail_frame = QFrame()
+        detail_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        detail_layout = QVBoxLayout(detail_frame)
+        self.detail_title = QLabel("选择一个软件")
+        self.detail_title.setFont(QFont(self.detail_title.font().family(), 14, QFont.Weight.DemiBold))
+        self.detail_text = QLabel("展开左侧类别并选择软件以查看说明。")
+        self.detail_text.setWordWrap(True)
+        self.detail_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail_layout.addWidget(self.detail_title)
+        detail_layout.addWidget(self.detail_text)
+        detail_layout.addStretch()
+        splitter.addWidget(detail_frame)
+        splitter.setSizes([590, 330])
+        root.addWidget(splitter, 1)
+
+        footer = QHBoxLayout()
+        self.selection_label = QLabel()
+        footer.addWidget(self.selection_label)
+        footer.addStretch()
+        self.install_button = QPushButton("安装所选软件")
+        self.install_button.clicked.connect(self.install_selected)
+        footer.addWidget(self.install_button)
+        root.addLayout(footer)
+
+        self.populate_tree()
+        self.apply_filter()
+
+    def populate_tree(self) -> None:
+        self._changing = True
+        try:
+            for category in self.categories:
+                parent = QTreeWidgetItem(self.tree, [category.name, self.policy_text(category)])
+                parent.setData(0, CATEGORY_ROLE, category.id)
+                parent.setFlags(parent.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                self.category_items[category.id] = parent
+                for application in category.applications:
+                    if application.channel == "optional-review":
+                        status = "第三方候选 / 未支持"
+                    else:
+                        status = "已安装" if application.installed else ("推荐" if application.recommended else "可安装")
+                    item = QTreeWidgetItem(parent, [application.name, status])
+                    item.setData(0, APP_ROLE, application.id)
+                    if application.installed:
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                        state = Qt.CheckState.Checked
+                    elif not application.selectable:
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                        state = Qt.CheckState.Unchecked
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        state = Qt.CheckState.Checked if application.default_selected else Qt.CheckState.Unchecked
+                    item.setCheckState(0, state)
+                    self.application_items[application.id] = item
+                self.enforce_initial_policy(category, parent)
+                self.update_parent_state(parent)
+            self.tree.expandToDepth(0)
+        finally:
+            self._changing = False
+        self.update_selection_summary()
+
+    @staticmethod
+    def policy_text(category: CategoryEntry) -> str:
+        if category.mode == "exclusive":
+            return "最多选择 1 项"
+        if category.mode == "bounded":
+            return f"最多选择 {category.max_selected} 项"
+        return "可多选"
+
+    def enforce_initial_policy(self, category: CategoryEntry, parent: QTreeWidgetItem) -> None:
+        locked_checked = sum(
+            parent.child(index).checkState(0) == Qt.CheckState.Checked
+            and not parent.child(index).flags() & Qt.ItemFlag.ItemIsUserCheckable
+            for index in range(parent.childCount())
+        )
+        checked_editable = [
+            parent.child(index) for index in range(parent.childCount())
+            if parent.child(index).checkState(0) == Qt.CheckState.Checked
+            and parent.child(index).flags() & Qt.ItemFlag.ItemIsUserCheckable
+        ]
+        maximum = category.max_selected
+        if maximum is not None:
+            available = max(0, maximum - locked_checked)
+            for item in checked_editable[available:]:
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+
+    def category_for_item(self, item: QTreeWidgetItem) -> CategoryEntry:
+        parent = item if item.data(0, CATEGORY_ROLE) else item.parent()
+        category_id = parent.data(0, CATEGORY_ROLE)
+        return next(category for category in self.categories if category.id == category_id)
+
+    def on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._changing or column != 0:
+            return
+        self._changing = True
+        try:
+            if item.data(0, CATEGORY_ROLE):
+                self.toggle_category(item)
+            else:
+                self.enforce_leaf_policy(item)
+                self.update_parent_state(item.parent())
+        finally:
+            self._changing = False
+        self.update_selection_summary()
+
+    def toggle_category(self, parent: QTreeWidgetItem) -> None:
+        category = self.category_for_item(parent)
+        select = parent.checkState(0) != Qt.CheckState.Unchecked
+        editable = [
+            parent.child(index) for index in range(parent.childCount())
+            if parent.child(index).flags() & Qt.ItemFlag.ItemIsUserCheckable
+        ]
+        locked_checked = sum(
+            parent.child(index).checkState(0) == Qt.CheckState.Checked
+            and not parent.child(index).flags() & Qt.ItemFlag.ItemIsUserCheckable
+            for index in range(parent.childCount())
+        )
+        limit = max(0, category.max_selected - locked_checked) if category.max_selected is not None else len(editable)
+        if select and category.max_selected is not None:
+            editable_checked = sum(child.checkState(0) == Qt.CheckState.Checked for child in editable)
+            select = editable_checked < limit
+        for index, child in enumerate(editable):
+            child.setCheckState(0, Qt.CheckState.Checked if select and index < limit else Qt.CheckState.Unchecked)
+        self.update_parent_state(parent)
+
+    def enforce_leaf_policy(self, item: QTreeWidgetItem) -> None:
+        if item.checkState(0) != Qt.CheckState.Checked:
+            return
+        category = self.category_for_item(item)
+        parent = item.parent()
+        checked = [parent.child(index) for index in range(parent.childCount()) if parent.child(index).checkState(0) == Qt.CheckState.Checked]
+        if category.mode == "exclusive":
+            locked_sibling = any(
+                sibling is not item and not sibling.flags() & Qt.ItemFlag.ItemIsUserCheckable
+                for sibling in checked
+            )
+            if locked_sibling:
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                self.statusBar().showMessage(f"{category.name}已有安装项，最多可选择 1 项", 5000)
+                return
+            for sibling in checked:
+                if sibling is not item and sibling.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    sibling.setCheckState(0, Qt.CheckState.Unchecked)
+        elif category.mode == "bounded" and category.max_selected is not None and len(checked) > category.max_selected:
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            self.statusBar().showMessage(f"{category.name}最多可选择 {category.max_selected} 项", 5000)
+
+    def update_parent_state(self, parent: QTreeWidgetItem) -> None:
+        states = [parent.child(index).checkState(0) for index in range(parent.childCount())]
+        if states and all(state == Qt.CheckState.Checked for state in states):
+            state = Qt.CheckState.Checked
+        elif any(state == Qt.CheckState.Checked for state in states):
+            state = Qt.CheckState.PartiallyChecked
+        else:
+            state = Qt.CheckState.Unchecked
+        parent.setCheckState(0, state)
+
+    def selected_application_ids(self) -> list[str]:
+        return sorted(
+            application.id for category in self.categories for application in category.applications
+            if application.selectable and not application.installed and self.application_items[application.id].checkState(0) == Qt.CheckState.Checked
+        )
+
+    def update_selection_summary(self) -> None:
+        count = len(self.selected_application_ids())
+        installed = sum(application.installed for category in self.categories for application in category.applications)
+        self.selection_label.setText(f"新安装 {count} 项　已安装 {installed} 项")
+        self.install_button.setEnabled(count > 0 and self.worker is None)
+
+    def apply_filter(self) -> None:
+        mode = self.filter_box.currentData()
+        for category in self.categories:
+            parent = self.category_items[category.id]
+            visible = False
+            for application in category.applications:
+                if mode == "installed":
+                    hidden = not application.installed
+                elif mode == "review":
+                    hidden = application.channel != "optional-review"
+                else:
+                    hidden = application.channel != "default"
+                self.application_items[application.id].setHidden(hidden)
+                visible = visible or not hidden
+            parent.setHidden(not visible)
+
+    def show_details(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
+        if current is None:
+            return
+        application_id = current.data(0, APP_ROLE)
+        if application_id:
+            application = next(
+                app for category in self.categories for app in category.applications if app.id == application_id
+            )
+            self.detail_title.setText(application.name)
+            if application.channel == "optional-review":
+                state = "第三方审核频道候选；当前 backend 未支持，不能安装"
+            else:
+                state = "已安装（Phase 1 不支持移除）" if application.installed else "尚未安装"
+            default = "是" if application.default_selected else "否"
+            opt_in = "需要" if application.user_opt_in_required else "不需要"
+            self.detail_text.setText(
+                f"{application.description}\n\n状态：{state}\n目录 ID：{application.id}\n"
+                f"提供方：{application.provider}\n来源：{application.source}\n许可证：{application.license}\n"
+                f"审核状态：{application.review_status}\n用户 opt-in：{opt_in}\n"
+                f"频道说明：{application.availability_reason or '-'}\n默认选择：{default}"
+            )
+        else:
+            category = self.category_for_item(current)
+            self.detail_title.setText(category.name)
+            self.detail_text.setText(
+                f"选择规则：{self.policy_text(category)}\n\n父复选框会按此规则选择或清除可用子项；"
+                "半选表示只选择了部分软件。"
+            )
+
+    def install_selected(self) -> None:
+        ids = self.selected_application_ids()
+        names = [self.application_items[value].text(0) for value in ids]
+        try:
+            transaction_dir, plan = self.backend.create_plan(ids)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法创建安装计划", str(exc))
+            return
+        dialog = PlanDialog(names, plan, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            shutil.rmtree(transaction_dir, ignore_errors=True)
+            return
+        self.install_button.setEnabled(False)
+        self.statusBar().showMessage("正在确认并应用安装计划…")
+        self.worker = ApplyThread(self.backend, transaction_dir)
+        self.worker.succeeded.connect(self.install_succeeded)
+        self.worker.failed.connect(self.install_failed)
+        self.worker.finished.connect(self.worker_finished)
+        self.worker.start()
+
+    def install_succeeded(self, output: str) -> None:
+        QMessageBox.information(self, "安装完成", output or "所选软件已安装。")
+
+    def install_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "安装失败", message)
+
+    def worker_finished(self) -> None:
+        if self.worker is not None:
+            self.worker.deleteLater()
+        self.worker = None
+        self.statusBar().clearMessage()
+        self.update_selection_summary()
+
+
+def main() -> int:
+    application = QApplication(sys.argv)
+    application.setApplicationName("Linxira Package Center")
+    application.setOrganizationName("Linxira")
+    catalog_path = Path(os.environ.get("LINXIRA_CATALOG_PATH", DEFAULT_CATALOG_PATH))
+    components_cli = os.environ.get("LINXIRA_COMPONENTS_CLI", DEFAULT_COMPONENTS_CLI)
+    state_value = os.environ.get("LINXIRA_INSTALLED_STATE_PATH")
+    try:
+        categories = load_catalog(catalog_path, load_installed_state(Path(state_value) if state_value else None))
+    except CatalogError as exc:
+        QMessageBox.critical(None, "无法打开软件中心", str(exc))
+        return 1
+    window = PackageCenterWindow(categories, ComponentsBackend(catalog_path, components_cli))
+    window.show()
+    return application.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
