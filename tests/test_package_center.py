@@ -235,8 +235,7 @@ class PackageCenterTests(unittest.TestCase):
         self.assertEqual(selection["sourceRequirements"], ["arch"])
         self.assertEqual(selection["catalogSha256"], hashlib.sha256(catalog_path.read_bytes()).hexdigest())
         self.assertEqual(calls[2][:3], ["pkexec", "linxira-components", "apply"])
-        self.assertEqual(calls[2][3:5], ["--catalog", str(catalog_path)])
-        self.assertEqual(calls[2][5], "--confirmation")
+        self.assertEqual(calls[2][3:], ["--confirmation", str(transaction_dir / "confirmation.json")])
 
     def test_v3_without_category_root_bundle_fails_closed_before_backend(self) -> None:
         backend = package_center.ComponentsBackend(

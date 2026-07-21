@@ -451,7 +451,6 @@ class ComponentsBackend:
             ])
             return self._run([
                 self.pkexec, self.components_cli, "apply",
-                "--catalog", str(self.catalog_path),
                 "--confirmation", str(transaction_dir / "confirmation.json"),
             ])
         finally:
