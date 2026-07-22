@@ -40,6 +40,7 @@ def application(identifier, category, *, default=False, order=0, review="reviewe
         "primaryCategory": category,
         "provider": provider,
         "source": source,
+        "artifact": {"type": "package", "ids": [identifier]},
         "license": {
             "classification": license_class,
             "spdx": "LicenseRef-Test" if license_class != "open-source" else "MIT",
@@ -134,8 +135,10 @@ class PackageCenterTests(unittest.TestCase):
         return path
 
     def test_source_version_and_v3_default_are_declared(self) -> None:
-        self.assertEqual(VERSION.read_text(encoding="utf-8"), "0.2.0\n")
+        self.assertEqual(VERSION.read_text(encoding="utf-8"), "0.2.1\n")
         self.assertEqual(package_center.DEFAULT_CATALOG_PATH, "/usr/share/linxira/catalog/catalog-v3.json")
+        self.assertEqual(package_center.DEFAULT_COMPONENTS_CLI, "/usr/bin/linxira-components")
+        self.assertEqual(package_center.DEFAULT_PKEXEC, "/usr/bin/pkexec")
 
     def test_v3_builds_application_tree_from_surface_categories_and_children(self) -> None:
         categories = package_center.load_catalog(self.write_catalog(catalog_v3()), {"firefox"})
@@ -155,6 +158,7 @@ class PackageCenterTests(unittest.TestCase):
         self.assertEqual(wps.provider, "aur")
         self.assertTrue(wps.user_opt_in_required)
         self.assertIn("需要接受许可", wps.license)
+        self.assertTrue(wps.requires_acceptance)
         self.assertFalse(wps.selectable)
 
     def test_v2_remains_supported_without_v3_fields(self) -> None:
@@ -174,6 +178,26 @@ class PackageCenterTests(unittest.TestCase):
             "installedApplications": ["firefox"],
             "applications": {"kate": {"state": "installed-managed"}, "vlc": {"state": "available"}},
         }), {"firefox", "kate"})
+
+    def test_detects_installed_applications_from_pacman_package_state(self) -> None:
+        catalog = self.write_catalog(catalog_v3())
+        result = mock.Mock(returncode=0, stdout="firefox\nwriter\nunrelated\n", stderr="")
+        with mock.patch.object(package_center.shutil, "which", return_value="/usr/bin/pacman"), \
+             mock.patch.object(package_center.subprocess, "run", return_value=result) as run:
+            installed = package_center.detect_installed_applications(catalog)
+        self.assertEqual(installed, {"firefox", "writer"})
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/pacman", "-Qq"])
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_pacman_state_removes_stale_external_application_state(self) -> None:
+        catalog = self.write_catalog(catalog_v3())
+        state = catalog.parent / "state.json"
+        state.write_text(json.dumps({"installedApplications": ["firefox"]}), encoding="utf-8")
+        result = mock.Mock(returncode=0, stdout="writer\n", stderr="")
+        with mock.patch.object(package_center.shutil, "which", return_value="/usr/bin/pacman"), \
+             mock.patch.object(package_center.subprocess, "run", return_value=result):
+            installed = package_center.detect_installed_applications(catalog, state)
+        self.assertEqual(installed, {"writer"})
 
     def make_window(self):
         categories = package_center.load_catalog(self.write_catalog(catalog_v3()), {"firefox"})

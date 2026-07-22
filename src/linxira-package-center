@@ -38,7 +38,9 @@ from PySide6.QtWidgets import (
 
 DEFAULT_CATALOG_PATH = "/usr/share/linxira/catalog/catalog-v3.json"
 DEFAULT_COMPONENTS_CLI = "/usr/bin/linxira-components"
+DEFAULT_PKEXEC = "/usr/bin/pkexec"
 APPLICATION_ID = re.compile(r"^[a-z0-9-]+$")
+PACKAGE_ID = re.compile(r"^[a-z0-9@._+-]+$")
 APP_ROLE = Qt.ItemDataRole.UserRole
 CATEGORY_ROLE = Qt.ItemDataRole.UserRole + 1
 
@@ -78,6 +80,7 @@ class ApplicationEntry:
     channel: str
     availability_reason: str
     user_opt_in_required: bool
+    requires_acceptance: bool
 
     @property
     def selectable(self) -> bool:
@@ -145,6 +148,57 @@ def load_installed_state(path: Path | None) -> set[str]:
         return _installed_ids(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError):
         return set()
+
+
+def detect_installed_applications(
+    catalog_path: Path,
+    state_path: Path | None = None,
+    *,
+    pacman: str = "pacman",
+) -> set[str]:
+    installed_ids = load_installed_state(state_path)
+    resolved = shutil.which(pacman)
+    if resolved is None:
+        return installed_ids
+    try:
+        result = subprocess.run(
+            [resolved, "-Qq"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return installed_ids
+    if result.returncode != 0:
+        return installed_ids
+    installed_packages = {
+        line.strip() for line in result.stdout.splitlines()
+        if PACKAGE_ID.fullmatch(line.strip())
+    }
+    try:
+        document = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return installed_ids
+    applications = document.get("applications", []) if isinstance(document, dict) else []
+    for application in applications:
+        if not isinstance(application, dict) or application.get("provider") != "pacman":
+            continue
+        artifact = application.get("artifact", {})
+        targets = artifact.get("ids", []) if isinstance(artifact, dict) else []
+        application_id = application.get("id")
+        if isinstance(application_id, str):
+            installed_ids.discard(application_id)
+        if (
+            isinstance(application_id, str)
+            and APPLICATION_ID.fullmatch(application_id)
+            and isinstance(targets, list)
+            and targets
+            and all(isinstance(target, str) and target in installed_packages for target in targets)
+        ):
+            installed_ids.add(application_id)
+    return installed_ids
 
 
 def load_catalog(path: Path, installed_ids: Iterable[str] = ()) -> tuple[CategoryEntry, ...]:
@@ -233,6 +287,9 @@ def load_catalog(path: Path, installed_ids: Iterable[str] = ()) -> tuple[Categor
             channel=str(channel),
             availability_reason=str(availability.get("reason", "")),
             user_opt_in_required=channel == "optional-review" or bool(source_document.get("userOptInRequired", False)),
+            requires_acceptance=bool(
+                isinstance(license_value, dict) and license_value.get("requiresAcceptance") is True
+            ),
         )
         grouped.setdefault(primary, []).append(entry)
 
@@ -400,7 +457,7 @@ def build_v3_selection(document: dict[str, Any], catalog_sha256: str, applicatio
 
 
 class ComponentsBackend:
-    def __init__(self, catalog_path: Path, components_cli: str, pkexec: str = "pkexec") -> None:
+    def __init__(self, catalog_path: Path, components_cli: str, pkexec: str = DEFAULT_PKEXEC) -> None:
         self.catalog_path = catalog_path
         self.components_cli = components_cli
         self.pkexec = pkexec
@@ -416,7 +473,11 @@ class ComponentsBackend:
             raise RuntimeError(message) from exc
         return (result.stdout or result.stderr).strip()
 
-    def create_plan(self, application_ids: Iterable[str]) -> tuple[Path, dict[str, Any]]:
+    def create_plan(
+        self,
+        application_ids: Iterable[str],
+        accepted_license_ids: Iterable[str] = (),
+    ) -> tuple[Path, dict[str, Any]]:
         ids = sorted(set(application_ids))
         if not ids or any(not APPLICATION_ID.fullmatch(value) for value in ids):
             raise RuntimeError("安装请求没有有效的 application ID")
@@ -425,6 +486,10 @@ class ComponentsBackend:
             raw = self.catalog_path.read_bytes()
             document = json.loads(raw)
             command = [self.components_cli, "plan", "--catalog", str(self.catalog_path), "--output-dir", str(transaction_dir)]
+            for application_id in sorted(set(accepted_license_ids)):
+                if application_id not in ids:
+                    raise RuntimeError("许可接受记录不属于当前安装请求")
+                command.extend(("--accept-license", application_id))
             if isinstance(document, dict) and document.get("catalogVersion") == 3:
                 selection = build_v3_selection(document, hashlib.sha256(raw).hexdigest(), ids)
                 selection_path = transaction_dir / "selection.json"
@@ -496,10 +561,18 @@ class PlanDialog(QDialog):
 
 
 class PackageCenterWindow(QMainWindow):
-    def __init__(self, categories: tuple[CategoryEntry, ...], backend: ComponentsBackend) -> None:
+    def __init__(
+        self,
+        categories: tuple[CategoryEntry, ...],
+        backend: ComponentsBackend,
+        catalog_path: Path | None = None,
+        state_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self.categories = categories
         self.backend = backend
+        self.catalog_path = catalog_path
+        self.state_path = state_path
         self.application_items: dict[str, QTreeWidgetItem] = {}
         self.category_items: dict[str, QTreeWidgetItem] = {}
         self._changing = False
@@ -597,6 +670,19 @@ class PackageCenterWindow(QMainWindow):
         finally:
             self._changing = False
         self.update_selection_summary()
+
+    def refresh_installed_state(self) -> None:
+        if self.catalog_path is None:
+            return
+        self.categories = load_catalog(
+            self.catalog_path,
+            detect_installed_applications(self.catalog_path, self.state_path),
+        )
+        self.tree.clear()
+        self.application_items.clear()
+        self.category_items.clear()
+        self.populate_tree()
+        self.apply_filter()
 
     @staticmethod
     def policy_text(category: CategoryEntry) -> str:
@@ -753,9 +839,29 @@ class PackageCenterWindow(QMainWindow):
 
     def install_selected(self) -> None:
         ids = self.selected_application_ids()
+        applications = {
+            application.id: application
+            for category in self.categories for application in category.applications
+        }
         names = [self.application_items[value].text(0) for value in ids]
+        accepted_license_ids = sorted(
+            application_id for application_id in ids
+            if applications[application_id].requires_acceptance
+        )
+        if accepted_license_ids:
+            answer = QMessageBox.question(
+                self,
+                "确认专有软件许可",
+                "以下软件需要明确接受许可才能安装：\n\n"
+                + "\n".join(self.application_items[value].text(0) for value in accepted_license_ids)
+                + "\n\n继续将把这些 application ID 的许可接受记录写入不可变事务计划。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         try:
-            transaction_dir, plan = self.backend.create_plan(ids)
+            transaction_dir, plan = self.backend.create_plan(ids, accepted_license_ids)
         except Exception as exc:
             QMessageBox.critical(self, "无法创建安装计划", str(exc))
             return
@@ -772,6 +878,7 @@ class PackageCenterWindow(QMainWindow):
         self.worker.start()
 
     def install_succeeded(self, output: str) -> None:
+        self.refresh_installed_state()
         QMessageBox.information(self, "安装完成", output or "所选软件已安装。")
 
     def install_failed(self, message: str) -> None:
@@ -790,14 +897,20 @@ def main() -> int:
     application.setApplicationName("Linxira Package Center")
     application.setOrganizationName("Linxira")
     catalog_path = Path(os.environ.get("LINXIRA_CATALOG_PATH", DEFAULT_CATALOG_PATH))
-    components_cli = os.environ.get("LINXIRA_COMPONENTS_CLI", DEFAULT_COMPONENTS_CLI)
+    components_cli = DEFAULT_COMPONENTS_CLI
     state_value = os.environ.get("LINXIRA_INSTALLED_STATE_PATH")
+    state_path = Path(state_value) if state_value else None
     try:
-        categories = load_catalog(catalog_path, load_installed_state(Path(state_value) if state_value else None))
+        categories = load_catalog(catalog_path, detect_installed_applications(catalog_path, state_path))
     except CatalogError as exc:
         QMessageBox.critical(None, "无法打开软件中心", str(exc))
         return 1
-    window = PackageCenterWindow(categories, ComponentsBackend(catalog_path, components_cli))
+    window = PackageCenterWindow(
+        categories,
+        ComponentsBackend(catalog_path, components_cli),
+        catalog_path,
+        state_path,
+    )
     window.show()
     return application.exec()
 
