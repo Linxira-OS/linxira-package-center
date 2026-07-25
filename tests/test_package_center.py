@@ -60,12 +60,12 @@ def catalog_v3(*, compatible_roots=True) -> dict:
     categories = [
         {
             "id": "app-web", "kind": "category", "surface": "applications",
-            "name": {"en": "Web", "zh_CN": "浏览器"}, "selection": {"mode": "exclusive"},
+            "name": {"en": "Web", "zh_CN": "浏览器"}, "selection": {"mode": "multi"},
             "children": ["firefox", "chromium", "brave"], "order": 10,
         },
         {
             "id": "app-office", "kind": "category", "surface": "applications",
-            "name": {"en": "Office"}, "selection": {"mode": "bounded", "maxSelected": 2},
+            "name": {"en": "Office"}, "selection": {"mode": "multi"},
             "children": ["writer", "sheets", "slides", "wps-office"], "order": 20,
         },
         {
@@ -209,13 +209,15 @@ class PackageCenterTests(unittest.TestCase):
 
     def test_tree_constraints_installed_lock_and_review_channel_filter(self) -> None:
         window = self.make_window()
+        self.assertTrue(window.category_items["app-web"].isExpanded())
+        self.assertFalse(window.category_items["app-office"].isExpanded())
         self.assertFalse(window.application_items["firefox"].flags() & Qt.ItemFlag.ItemIsUserCheckable)
         self.assertFalse(window.application_items["wps-office"].flags() & Qt.ItemFlag.ItemIsUserCheckable)
-        self.assertEqual(window.application_items["slides"].checkState(0), Qt.CheckState.Unchecked)
+        self.assertEqual(window.application_items["slides"].checkState(0), Qt.CheckState.Checked)
 
         window.application_items["chromium"].setCheckState(0, Qt.CheckState.Checked)
-        self.assertEqual(window.application_items["chromium"].checkState(0), Qt.CheckState.Unchecked)
-        self.assertEqual(window.selected_application_ids(), ["sheets", "writer"])
+        self.assertEqual(window.application_items["chromium"].checkState(0), Qt.CheckState.Checked)
+        self.assertEqual(window.selected_application_ids(), ["chromium", "sheets", "slides", "writer"])
 
         window.filter_box.setCurrentIndex(2)
         self.assertFalse(window.application_items["wps-office"].isHidden())
@@ -286,6 +288,16 @@ class PackageCenterTests(unittest.TestCase):
         self.assertIn("--application", calls[0])
         self.assertNotIn("--selection", calls[0])
 
+    def test_components_json_error_message_is_unwrapped(self) -> None:
+        error = subprocess.CalledProcessError(
+            3,
+            ["linxira-components", "apply"],
+            stderr='{"error":"TRANSACTION_FAILED","message":"pacman transaction failed\\nstderr:\\nmirror unavailable"}',
+        )
+        with mock.patch.object(package_center.subprocess, "run", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "mirror unavailable"):
+                package_center.ComponentsBackend._run(["linxira-components", "apply"])
+
     def test_client_has_no_direct_package_manager_path(self) -> None:
         source = CLIENT.read_text(encoding="utf-8")
         self.assertNotIn("subprocess.run([\"pacman\"", source)
@@ -293,7 +305,8 @@ class PackageCenterTests(unittest.TestCase):
 
     def test_desktop_entry_uses_canonical_executable(self) -> None:
         desktop = DESKTOP.read_text(encoding="utf-8")
-        self.assertIn("Name=Linxira Package Center", desktop)
+        self.assertIn("Name=Quick System Software Setup", desktop)
+        self.assertIn("Name[zh_CN]=快速配置系统软件", desktop)
         self.assertIn("Exec=/usr/bin/linxira-package-center", desktop)
 
 

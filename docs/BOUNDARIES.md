@@ -1,10 +1,10 @@
 # Product Boundaries
 
-Package Center may read catalog and installed-state data, collect a user
+Quick System Software Setup may read catalog and installed-state data, collect a user
 selection, display an immutable plan, request authorization for an already
 confirmed transaction, and display backend progress and receipts.
 
-Package Center must not:
+Quick System Software Setup must not:
 
 - accept package names or shell commands from UI input;
 - invoke pacman, AUR helpers, Flatpak, npm, or other installers directly;

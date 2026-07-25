@@ -1,9 +1,9 @@
-# Linxira Package Center
+# Quick System Software Setup
 
-Linxira Package Center is the user-facing application and optional-capability
-manager for Linxira OS.
+Quick System Software Setup is the curated application setup tool for Linxira OS.
+Shelly remains the general-purpose software center.
 
-Current source version: `0.2.0`.
+Current source version: `0.2.1`.
 
 The Phase 1 implementation is an install-only PySide6 application. It defaults
 to Catalog v3, presents reviewed applications in an expandable three-state
@@ -61,7 +61,7 @@ selection is bound to the exact catalog SHA-256 and release, and retains
 category/application paths plus `optional` + `user` provenance.
 
 The currently available `linxira-components` protocol requires every
-`requestedBy` root to be a catalog bundle. Package Center therefore accepts a
+`requestedBy` root to be a catalog bundle. Quick System Software Setup therefore accepts a
 v3 application category as a transaction root only when the catalog also
 provides a bundle with the same ID, exactly the same direct application
 children, and all children marked `optional`. This prevents a category click
@@ -69,7 +69,7 @@ from pulling required/recommended component side effects. If that contract is
 absent, as in the current standalone Catalog v3, planning fails closed before
 the backend is invoked. The catalog/backend repositories must add and validate
 the category-root contract (and align the backend's object-form `artifact`
-support) before those selections can install; Package Center does not forge a
+support) before those selections can install; Quick System Software Setup does not forge a
 bundle path or claim support.
 
 ## Development

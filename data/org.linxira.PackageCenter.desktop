@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Linxira Package Center
-Name[zh_CN]=Linxira 软件中心
-Comment=Install reviewed Linxira applications
-Comment[zh_CN]=安装经过审核的 Linxira 应用
+Name=Quick System Software Setup
+Name[zh_CN]=快速配置系统软件
+Comment=Configure reviewed Linxira applications
+Comment[zh_CN]=配置经过审核的 Linxira 应用
 Exec=/usr/bin/linxira-package-center
 Icon=system-software-install
 Terminal=false
