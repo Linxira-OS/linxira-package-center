@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.linxira.PackageCenter</id>
+  <name>Quick System Software Setup</name>
+  <summary>Configure reviewed applications from the Linxira catalog</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <launchable type="desktop-id">org.linxira.PackageCenter.desktop</launchable>
+  <provides><binary>linxira-package-center</binary></provides>
+  <description>
+    <p>Quick System Software Setup selects reviewed applications and delegates immutable installation plans to the Linxira Components backend.</p>
+  </description>
+  <developer id="org.linxira"><name>Linxira OS contributors</name></developer>
+  <url type="homepage">https://linxira-os.github.io/</url>
+  <url type="vcs-browser">https://github.com/Linxira-OS/linxira-package-center</url>
+  <url type="bugtracker">https://github.com/Linxira-OS/linxira-package-center/issues</url>
+  <url type="help">https://linxira-os.github.io/linxira-wiki/</url>
+  <releases><release version="0.2.1" date="2026-07-26" /></releases>
+  <content_rating type="oars-1.1" />
+</component>

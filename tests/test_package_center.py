@@ -189,6 +189,21 @@ class PackageCenterTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["/usr/bin/pacman", "-Qq"])
         self.assertFalse(run.call_args.kwargs["shell"])
 
+    def test_detects_partial_multi_package_application_cohort(self) -> None:
+        document = catalog_v3()
+        firefox = next(item for item in document["applications"] if item["id"] == "firefox")
+        firefox["artifact"]["ids"] = ["firefox", "firefox-i18n"]
+        catalog = self.write_catalog(document)
+        result = mock.Mock(returncode=0, stdout="firefox\n", stderr="")
+        with mock.patch.object(package_center.shutil, "which", return_value="/usr/bin/pacman"), \
+             mock.patch.object(package_center.subprocess, "run", return_value=result):
+            states = package_center.detect_application_states(catalog)
+        self.assertEqual(states["firefox"], "partial")
+        categories = package_center.load_catalog(catalog, states)
+        entry = next(app for category in categories for app in category.applications if app.id == "firefox")
+        self.assertFalse(entry.installed)
+        self.assertEqual(entry.installed_state, "partial")
+
     def test_pacman_state_removes_stale_external_application_state(self) -> None:
         catalog = self.write_catalog(catalog_v3())
         state = catalog.parent / "state.json"

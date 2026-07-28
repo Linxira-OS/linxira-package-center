@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -43,6 +43,34 @@ APPLICATION_ID = re.compile(r"^[a-z0-9-]+$")
 PACKAGE_ID = re.compile(r"^[a-z0-9@._+-]+$")
 APP_ROLE = Qt.ItemDataRole.UserRole
 CATEGORY_ROLE = Qt.ItemDataRole.UserRole + 1
+APP_VERSION = "0.2.1"
+HOMEPAGE_URL = "https://linxira-os.github.io/"
+REPOSITORY_URL = "https://github.com/Linxira-OS/linxira-package-center"
+ISSUES_URL = f"{REPOSITORY_URL}/issues"
+DOCUMENTATION_URL = "https://linxira-os.github.io/linxira-wiki/"
+
+
+def show_about(parent: QWidget | None = None) -> QDialog:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("About Quick System Software Setup")
+    dialog.setMinimumWidth(420)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(QLabel(f"<h2>Quick System Software Setup</h2><p>Version {APP_VERSION}</p>"))
+    details = QLabel(
+        "<p>Developed by Linxira OS contributors.<br>Licensed under the MIT License.</p>"
+        f'<p><a href="{HOMEPAGE_URL}">Linxira OS homepage</a><br>'
+        f'<a href="{REPOSITORY_URL}">Project repository</a><br>'
+        f'<a href="{ISSUES_URL}">Report an issue</a><br>'
+        f'<a href="{DOCUMENTATION_URL}">Documentation</a></p>'
+    )
+    details.setOpenExternalLinks(True)
+    details.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+    layout.addWidget(details)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    dialog.open()
+    return dialog
 
 
 class CatalogError(ValueError):
@@ -72,7 +100,7 @@ class ApplicationEntry:
     default_selected: bool
     recommended: bool
     order: int
-    installed: bool
+    installed_state: str
     source: str
     license: str
     provider: str
@@ -85,6 +113,10 @@ class ApplicationEntry:
     @property
     def selectable(self) -> bool:
         return self.channel == "default"
+
+    @property
+    def installed(self) -> bool:
+        return self.installed_state == "installed"
 
 
 @dataclass(frozen=True)
@@ -150,29 +182,25 @@ def load_installed_state(path: Path | None) -> set[str]:
         return set()
 
 
-def detect_installed_applications(
+def detect_application_states(
     catalog_path: Path,
     state_path: Path | None = None,
     *,
     pacman: str = "pacman",
-) -> set[str]:
-    installed_ids = load_installed_state(state_path)
+) -> dict[str, str]:
+    states = {application_id: "installed" for application_id in load_installed_state(state_path)}
     resolved = shutil.which(pacman)
     if resolved is None:
-        return installed_ids
+        return states
     try:
         result = subprocess.run(
-            [resolved, "-Qq"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            shell=False,
+            [resolved, "-Qq"], check=False, capture_output=True, text=True,
+            timeout=15, shell=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return installed_ids
+        return states
     if result.returncode != 0:
-        return installed_ids
+        return states
     installed_packages = {
         line.strip() for line in result.stdout.splitlines()
         if PACKAGE_ID.fullmatch(line.strip())
@@ -180,7 +208,7 @@ def detect_installed_applications(
     try:
         document = json.loads(catalog_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return installed_ids
+        return states
     applications = document.get("applications", []) if isinstance(document, dict) else []
     for application in applications:
         if not isinstance(application, dict) or application.get("provider") != "pacman":
@@ -188,20 +216,30 @@ def detect_installed_applications(
         artifact = application.get("artifact", {})
         targets = artifact.get("ids", []) if isinstance(artifact, dict) else []
         application_id = application.get("id")
-        if isinstance(application_id, str):
-            installed_ids.discard(application_id)
-        if (
-            isinstance(application_id, str)
-            and APPLICATION_ID.fullmatch(application_id)
-            and isinstance(targets, list)
-            and targets
-            and all(isinstance(target, str) and target in installed_packages for target in targets)
-        ):
-            installed_ids.add(application_id)
-    return installed_ids
+        if not isinstance(application_id, str) or not APPLICATION_ID.fullmatch(application_id):
+            continue
+        states.pop(application_id, None)
+        if not isinstance(targets, list) or not targets:
+            continue
+        present = sum(isinstance(target, str) and target in installed_packages for target in targets)
+        states[application_id] = "installed" if present == len(targets) else "partial" if present else "absent"
+    return states
 
 
-def load_catalog(path: Path, installed_ids: Iterable[str] = ()) -> tuple[CategoryEntry, ...]:
+def detect_installed_applications(
+    catalog_path: Path,
+    state_path: Path | None = None,
+    *,
+    pacman: str = "pacman",
+) -> set[str]:
+    return {
+        application_id for application_id, state in
+        detect_application_states(catalog_path, state_path, pacman=pacman).items()
+        if state == "installed"
+    }
+
+
+def load_catalog(path: Path, installed_ids: Iterable[str] | dict[str, str] = ()) -> tuple[CategoryEntry, ...]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -220,7 +258,10 @@ def load_catalog(path: Path, installed_ids: Iterable[str] = ()) -> tuple[Categor
         for value in raw_categories
         if isinstance(value, dict) and isinstance(value.get("id"), str)
     } if isinstance(raw_categories, list) else {}
-    installed = set(installed_ids)
+    installed_states = (
+        dict(installed_ids) if isinstance(installed_ids, dict)
+        else {application_id: "installed" for application_id in installed_ids}
+    )
     grouped: dict[str, list[ApplicationEntry]] = {}
     raw_applications: dict[str, dict[str, Any]] = {}
 
@@ -279,7 +320,7 @@ def load_catalog(path: Path, installed_ids: Iterable[str] = ()) -> tuple[Categor
             default_selected=bool(presentation.get("defaultSelected", raw.get("defaultSelected", False))),
             recommended=bool(presentation.get("recommended", raw.get("recommended", False))),
             order=presentation.get("order", raw.get("order", 0)) if isinstance(presentation.get("order", raw.get("order", 0)), int) else 0,
-            installed=application_id in installed,
+            installed_state=installed_states.get(application_id, "absent"),
             source=source,
             license=license_text,
             provider=provider,
@@ -587,6 +628,9 @@ class PackageCenterWindow(QMainWindow):
 
         self.setWindowTitle("快速配置系统软件")
         self.resize(980, 680)
+        about = QAction("About Quick System Software Setup", self)
+        about.triggered.connect(lambda: show_about(self))
+        self.menuBar().addMenu("Help").addAction(about)
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(22, 18, 22, 18)
@@ -657,7 +701,11 @@ class PackageCenterWindow(QMainWindow):
                     if application.channel == "optional-review":
                         status = "第三方候选 / 未支持"
                     else:
-                        status = "已安装" if application.installed else ("推荐" if application.recommended else "可安装")
+                        status = (
+                            "已安装" if application.installed
+                            else "部分安装" if application.installed_state == "partial"
+                            else "推荐" if application.recommended else "可安装"
+                        )
                     item = QTreeWidgetItem(parent, [application.name, status])
                     item.setData(0, APP_ROLE, application.id)
                     if application.installed:
@@ -668,7 +716,9 @@ class PackageCenterWindow(QMainWindow):
                         state = Qt.CheckState.Unchecked
                     else:
                         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                        state = Qt.CheckState.Checked if application.default_selected else Qt.CheckState.Unchecked
+                        state = Qt.CheckState.Checked if (
+                            application.default_selected or application.installed_state == "partial"
+                        ) else Qt.CheckState.Unchecked
                     item.setCheckState(0, state)
                     self.application_items[application.id] = item
                 self.enforce_initial_policy(category, parent)
@@ -685,7 +735,7 @@ class PackageCenterWindow(QMainWindow):
             return
         self.categories = load_catalog(
             self.catalog_path,
-            detect_installed_applications(self.catalog_path, self.state_path),
+            detect_application_states(self.catalog_path, self.state_path),
         )
         self.tree.clear()
         self.application_items.clear()
@@ -798,7 +848,11 @@ class PackageCenterWindow(QMainWindow):
     def update_selection_summary(self) -> None:
         count = len(self.selected_application_ids())
         installed = sum(application.installed for category in self.categories for application in category.applications)
-        self.selection_label.setText(f"新安装 {count} 项　已安装 {installed} 项")
+        partial = sum(
+            application.installed_state == "partial"
+            for category in self.categories for application in category.applications
+        )
+        self.selection_label.setText(f"待补全/新安装 {count} 项　已安装 {installed} 项　部分安装 {partial} 项")
         self.install_button.setEnabled(count > 0 and self.worker is None)
 
     def apply_filter(self) -> None:
@@ -808,7 +862,7 @@ class PackageCenterWindow(QMainWindow):
             visible = False
             for application in category.applications:
                 if mode == "installed":
-                    hidden = not application.installed
+                    hidden = application.installed_state not in {"installed", "partial"}
                 elif mode == "review":
                     hidden = application.channel != "optional-review"
                 else:
@@ -829,7 +883,11 @@ class PackageCenterWindow(QMainWindow):
             if application.channel == "optional-review":
                 state = "第三方审核频道候选；当前 backend 未支持，不能安装"
             else:
-                state = "已安装（Phase 1 不支持移除）" if application.installed else "尚未安装"
+                state = (
+                    "已安装（Phase 1 不支持移除）" if application.installed
+                    else "部分安装；将补全缺失软件包" if application.installed_state == "partial"
+                    else "尚未安装"
+                )
             default = "是" if application.default_selected else "否"
             opt_in = "需要" if application.user_opt_in_required else "不需要"
             self.detail_text.setText(
@@ -910,7 +968,7 @@ def main() -> int:
     state_value = os.environ.get("LINXIRA_INSTALLED_STATE_PATH")
     state_path = Path(state_value) if state_value else None
     try:
-        categories = load_catalog(catalog_path, detect_installed_applications(catalog_path, state_path))
+        categories = load_catalog(catalog_path, detect_application_states(catalog_path, state_path))
     except CatalogError as exc:
         QMessageBox.critical(None, "无法打开快速配置系统软件", str(exc))
         return 1
