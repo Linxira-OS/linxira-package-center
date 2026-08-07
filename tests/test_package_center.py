@@ -31,7 +31,8 @@ loader.exec_module(package_center)
 
 
 def application(identifier, category, *, default=False, order=0, review="reviewed", status="available",
-                channel="default", provider="pacman", source="arch", license_class="open-source"):
+                channel="default", provider="pacman", source="arch", license_class="open-source",
+                offline="online-only"):
     return {
         "id": identifier,
         "kind": "application",
@@ -50,6 +51,7 @@ def application(identifier, category, *, default=False, order=0, review="reviewe
         "availability": {
             "status": status,
             "channel": channel,
+            "offlinePolicy": offline,
             "reason": "Explicit third-party opt-in is required." if channel == "optional-review" else "",
         },
         "presentation": {"recommended": default, "defaultSelected": default, "order": order},
@@ -75,7 +77,7 @@ def catalog_v3(*, compatible_roots=True) -> dict:
         },
     ]
     applications = [
-        application("firefox", "app-web", default=True, order=20),
+        application("firefox", "app-web", default=True, order=20, offline="included"),
         application("chromium", "app-web", order=10),
         application("brave", "app-web", order=30, review="source-review-pending",
                     status="review-channel", channel="optional-review", provider="aur", source="aur",
@@ -234,12 +236,32 @@ class PackageCenterTests(unittest.TestCase):
         self.assertEqual(window.application_items["chromium"].checkState(0), Qt.CheckState.Checked)
         self.assertEqual(window.selected_application_ids(), ["chromium", "sheets", "slides", "writer"])
 
-        window.filter_box.setCurrentIndex(2)
+        window.filter_box.setCurrentIndex(4)
         self.assertFalse(window.application_items["wps-office"].isHidden())
         self.assertTrue(window.application_items["writer"].isHidden())
         window.show_details(window.application_items["wps-office"], None)
         self.assertIn("当前 backend 未支持", window.detail_text.text())
         self.assertIn("用户 opt-in：需要", window.detail_text.text())
+
+    def test_offline_badge_and_offline_online_filters(self) -> None:
+        window = self.make_window()
+        applications = {
+            app.id: app
+            for category in window.categories for app in category.applications
+        }
+        self.assertEqual(applications["firefox"].offline_label, "镜像自带")
+        self.assertEqual(applications["chromium"].offline_label, "需联网")
+        self.assertIn("镜像自带", window.application_items["firefox"].text(1))
+        self.assertIn("需联网", window.application_items["chromium"].text(1))
+
+        window.filter_box.setCurrentIndex(1)
+        self.assertFalse(window.application_items["firefox"].isHidden())
+        self.assertTrue(window.application_items["chromium"].isHidden())
+
+        window.filter_box.setCurrentIndex(2)
+        self.assertTrue(window.application_items["firefox"].isHidden())
+        self.assertFalse(window.application_items["chromium"].isHidden())
+        self.assertTrue(window.application_items["wps-office"].isHidden())
 
     def test_v3_selection_document_and_selection_cli_argument(self) -> None:
         catalog_path = self.write_catalog(catalog_v3())
