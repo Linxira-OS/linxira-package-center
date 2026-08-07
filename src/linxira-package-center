@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 DEFAULT_CATALOG_PATH = "/usr/share/linxira/catalog/catalog-v3.json"
 DEFAULT_COMPONENTS_CLI = "/usr/bin/linxira-components"
 DEFAULT_PKEXEC = "/usr/bin/pkexec"
+DEFAULT_PENDING_INSTALL_PATH = "/var/lib/linxira/pending-install.json"
 APPLICATION_ID = re.compile(r"^[a-z0-9-]+$")
 PACKAGE_ID = re.compile(r"^[a-z0-9@._+-]+$")
 APP_ROLE = Qt.ItemDataRole.UserRole
@@ -190,6 +191,24 @@ def load_installed_state(path: Path | None) -> set[str]:
         return _installed_ids(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError):
         return set()
+
+
+def load_pending_install(path: Path | None) -> set[str]:
+    """Leaf IDs deferred at install time, consumed for first-boot continuation."""
+    if path is None or not path.is_file():
+        return set()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    pending = document.get("pending") if isinstance(document, dict) else None
+    if not isinstance(pending, list):
+        return set()
+    return {
+        item.get("leafId")
+        for item in pending
+        if isinstance(item, dict) and isinstance(item.get("leafId"), str)
+    }
 
 
 def detect_application_states(
@@ -635,12 +654,15 @@ class PackageCenterWindow(QMainWindow):
         backend: ComponentsBackend,
         catalog_path: Path | None = None,
         state_path: Path | None = None,
+        pending_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.categories = categories
         self.backend = backend
         self.catalog_path = catalog_path
         self.state_path = state_path
+        self.pending_path = pending_path
+        self.pending_ids = load_pending_install(pending_path)
         self.application_items: dict[str, QTreeWidgetItem] = {}
         self.category_items: dict[str, QTreeWidgetItem] = {}
         self._changing = False
@@ -747,7 +769,9 @@ class PackageCenterWindow(QMainWindow):
                     else:
                         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                         state = Qt.CheckState.Checked if (
-                            application.default_selected or application.installed_state == "partial"
+                            application.default_selected
+                            or application.id in self.pending_ids
+                            or application.installed_state == "partial"
                         ) else Qt.CheckState.Unchecked
                     item.setCheckState(0, state)
                     self.application_items[application.id] = item
@@ -986,7 +1010,24 @@ class PackageCenterWindow(QMainWindow):
 
     def install_succeeded(self, output: str) -> None:
         self.refresh_installed_state()
+        self._clear_pending_if_complete()
         QMessageBox.information(self, "安装完成", output or "所选软件已安装。")
+
+    def _clear_pending_if_complete(self) -> None:
+        if not self.pending_ids or self.pending_path is None:
+            return
+        installed = {
+            app.id
+            for category in self.categories
+            for app in category.applications
+            if app.installed
+        }
+        if self.pending_ids <= installed:
+            try:
+                self.pending_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.pending_ids = set()
 
     def install_failed(self, message: str) -> None:
         QMessageBox.critical(self, "安装失败", message)
@@ -1008,6 +1049,10 @@ def main() -> int:
     components_cli = DEFAULT_COMPONENTS_CLI
     state_value = os.environ.get("LINXIRA_INSTALLED_STATE_PATH")
     state_path = Path(state_value) if state_value else None
+    pending_value = os.environ.get("LINXIRA_PENDING_INSTALL_PATH")
+    pending_path = Path(pending_value) if pending_value else None
+    if pending_path is None:
+        pending_path = Path(DEFAULT_PENDING_INSTALL_PATH)
     try:
         categories = load_catalog(catalog_path, detect_application_states(catalog_path, state_path))
     except CatalogError as exc:
@@ -1018,6 +1063,7 @@ def main() -> int:
         ComponentsBackend(catalog_path, components_cli),
         catalog_path,
         state_path,
+        pending_path,
     )
     window.show()
     return application.exec()

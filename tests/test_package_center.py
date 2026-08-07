@@ -263,6 +263,40 @@ class PackageCenterTests(unittest.TestCase):
         self.assertFalse(window.application_items["chromium"].isHidden())
         self.assertTrue(window.application_items["wps-office"].isHidden())
 
+    def test_pending_install_precheck_and_clear(self) -> None:
+        catalog = self.write_catalog(catalog_v3())
+        pending_path = catalog.parent / "pending-install.json"
+        pending_path.write_text(json.dumps({
+            "schemaVersion": "org.linxira.pending-install.v1",
+            "pending": [
+                {"leafId": "chromium", "offlinePolicy": "online-only", "packages": ["chromium"]},
+                {"leafId": "firefox", "offlinePolicy": "included", "packages": ["firefox"]},
+            ],
+        }), encoding="utf-8")
+        categories = package_center.load_catalog(catalog, {"firefox"})
+        window = package_center.PackageCenterWindow(
+            categories,
+            package_center.ComponentsBackend(catalog, "linxira-components"),
+            catalog,
+            None,
+            pending_path,
+        )
+        self.addCleanup(window.close)
+        self.assertEqual(window.pending_ids, {"chromium", "firefox"})
+        self.assertEqual(window.application_items["chromium"].checkState(0), Qt.CheckState.Checked)
+        window.pending_ids = {"firefox"}
+        window._clear_pending_if_complete()
+        self.assertFalse(pending_path.exists())
+        self.assertEqual(window.pending_ids, set())
+
+    def test_pending_install_path_defaults_to_absent(self) -> None:
+        self.assertEqual(package_center.load_pending_install(None), set())
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "pending-install.json"
+            self.assertEqual(package_center.load_pending_install(missing), set())
+            missing.write_text("not json", encoding="utf-8")
+            self.assertEqual(package_center.load_pending_install(missing), set())
+
     def test_v3_selection_document_and_selection_cli_argument(self) -> None:
         catalog_path = self.write_catalog(catalog_v3())
         backend = package_center.ComponentsBackend(catalog_path, "linxira-components", "pkexec")
