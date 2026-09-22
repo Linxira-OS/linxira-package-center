@@ -137,7 +137,7 @@ class PackageCenterTests(unittest.TestCase):
         return path
 
     def test_source_version_and_v3_default_are_declared(self) -> None:
-        self.assertEqual(VERSION.read_text(encoding="utf-8"), "0.2.1\n")
+        self.assertEqual(VERSION.read_text(encoding="utf-8"), "0.2.2\n")
         self.assertEqual(package_center.DEFAULT_CATALOG_PATH, "/usr/share/linxira/catalog/catalog-v3.json")
         self.assertEqual(package_center.DEFAULT_COMPONENTS_CLI, "/usr/bin/linxira-components")
         self.assertEqual(package_center.DEFAULT_PKEXEC, "/usr/bin/pkexec")
