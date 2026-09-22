@@ -307,6 +307,24 @@ def load_catalog(path: Path, installed_ids: Iterable[str] | dict[str, str] = ())
         if isinstance(value, dict) and isinstance(value.get("id"), str)
     }
 
+    # 2026-09-22: Linxira 自研软件合成标签 —— source=linxira-operations 的条目
+    # 聚合为独立「Linxira 自研」分类, 不占用安装器通用分类 children。
+    firstparty_ids = {
+        raw["id"]
+        for raw in document["applications"]
+        if isinstance(raw, dict)
+        and raw.get("source") == "linxira-operations"
+        and isinstance(raw.get("id"), str)
+        and APPLICATION_ID.fullmatch(raw["id"])
+    }
+    if firstparty_ids:
+        category_documents.setdefault("linxira-firstparty", {
+            "id": "linxira-firstparty",
+            "name": {"en": "Linxira First-Party", "zh_CN": "Linxira 自研"},
+            "selection": {"mode": "multi"},
+            "order": 1000,
+        })
+
     def add_application(raw: dict[str, Any], primary: str) -> None:
         application_id = raw["id"]
         review = raw.get("review", {})
@@ -323,7 +341,12 @@ def load_catalog(path: Path, installed_ids: Iterable[str] | dict[str, str] = ())
                 return
             channel = "default"
         elif channel == "default":
-            if review_status != "reviewed" or status != "available" or provider != "pacman" or source != "arch":
+            if review_status != "reviewed" or status != "available":
+                return
+            if source == "linxira-operations":
+                # 2026-09-22: 自研软件走签名 [linxira] 仓库(builtin provider)
+                pass
+            elif provider != "pacman" or source != "arch":
                 return
         elif channel == "optional-review":
             if status != "review-channel":
@@ -386,6 +409,10 @@ def load_catalog(path: Path, installed_ids: Iterable[str] | dict[str, str] = ())
             if not isinstance(primary, str) or not primary:
                 primary = application_categories[0] if isinstance(application_categories, list) and application_categories else "other"
             add_application(raw, primary)
+
+    for application_id in sorted(firstparty_ids):
+        if application_id in raw_applications and application_id not in grouped:
+            add_application(raw_applications[application_id], "linxira-firstparty")
 
     categories: list[CategoryEntry] = []
     for index, (category_id, applications) in enumerate(grouped.items()):
