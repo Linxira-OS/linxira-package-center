@@ -20,10 +20,14 @@
   **绝不用 `--application`**;选择绑定到精确的 catalog SHA-256 与 release。
 - 已安装态可选,从 `LINXIRA_INSTALLED_STATE_PATH` 读取;未提供状态文档时 catalog 仍完全可用,Installed 视图为空。
 - 可选复核信道视图为显式、只读的 opt-in;AUR / WPS / 专有/混合许可等第三方候选标注来源与许可后**保持禁用**。
+- **视觉基准**(2026-10-14):UI 采用与 `linxira-welcome` 同源的 Linxira 视觉基准(Fusion + 深色跟随 +
+  品牌青 `#20b8a6` / 深青 `#147f78`, 圆角 8-10px)。本仓是**单文件脚本**, 主题**内联**在
+  `src/linxira-package-center`(`THEME_QSS` + `apply_theme()`), 不新增资源文件 ⇒ 不动打包面、不加依赖。
+  改配色/间距请与 `linxira-welcome`、`linxira-component-manager/theme.py` 同步。
 
 ## 目录布局
 
-- `src/linxira-package-center`:单一入口脚本(无 `pyproject.toml`)
+- `src/linxira-package-center`:单一入口脚本(无 `pyproject.toml`)；含内联主题层 `THEME_QSS` / `apply_theme()`
 - `tests/`:`test_package_center.py`、`test_about_metadata.py`
 - `data/`:`org.linxira.PackageCenter.desktop`、`org.linxira.PackageCenter.metainfo.xml`
 - `docs/BOUNDARIES.md`、`requirements.txt`

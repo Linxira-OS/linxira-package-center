@@ -14,8 +14,8 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import QSize, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -45,11 +45,110 @@ APPLICATION_ID = re.compile(r"^[a-z0-9-]+$")
 PACKAGE_ID = re.compile(r"^[a-z0-9@._+-]+$")
 APP_ROLE = Qt.ItemDataRole.UserRole
 CATEGORY_ROLE = Qt.ItemDataRole.UserRole + 1
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 HOMEPAGE_URL = "https://linxira-os.github.io/"
 REPOSITORY_URL = "https://github.com/Linxira-OS/linxira-package-center"
 ISSUES_URL = f"{REPOSITORY_URL}/issues"
 DOCUMENTATION_URL = "https://linxira-os.github.io/linxira-wiki/"
+
+
+# ---- Linxira 视觉基准（与 linxira-welcome/src/linxira-welcome 同源，两边同步改）------
+# 品牌青 #20b8a6（高亮）/ 深青 #147f78（主按钮）；圆角 8-10px。
+# 本仓是单文件应用, PKGBUILD 只装脚本/desktop/metainfo/VERSION/LICENSE,
+# 所以主题内联在这里, 不新增外部 .qss 资源(不改打包面, 也不引入新依赖)。
+ACCENT = "#20b8a6"
+ACCENT_STRONG = "#147f78"
+SUCCESS = "#3fbf7f"
+WARNING = "#e0a33e"
+
+THEME_QSS = """
+QMainWindow, QDialog, QWidget { font-size: 13px; }
+QLabel#heroTitle { font-size: 22px; font-weight: 700; }
+QLabel#heroSubtitle { color: palette(placeholder-text); }
+QFrame#heroCard { background: palette(base); border: 1px solid palette(midlight); border-radius: 10px; }
+QComboBox#filterBox { min-height: 34px; padding: 4px 10px; border: 1px solid palette(midlight);
+                      border-radius: 8px; background: palette(base); }
+QComboBox#filterBox:hover { border-color: #20b8a6; }
+QComboBox#filterBox::drop-down { border: 0; width: 22px; }
+QComboBox#filterBox QAbstractItemView { border: 1px solid palette(midlight); border-radius: 8px;
+                                       padding: 4px; background: palette(base); }
+QTreeWidget#softwareTree { background: palette(base); border: 1px solid palette(midlight);
+                           border-radius: 10px; padding: 6px; outline: 0; }
+QTreeWidget#softwareTree::item { height: 34px; padding: 4px 6px; border-radius: 6px; }
+QTreeWidget#softwareTree::item:hover { background: rgba(32, 184, 166, 12%); }
+QTreeWidget#softwareTree::item:selected { background: rgba(32, 184, 166, 22%); color: palette(text); }
+QHeaderView::section { background: transparent; border: 0; border-bottom: 1px solid palette(midlight);
+                       padding: 8px 6px; font-weight: 600; color: palette(placeholder-text); }
+QFrame#detailCard { background: palette(base); border: 1px solid palette(midlight); border-radius: 10px; }
+QLabel#detailTitle { font-size: 16px; font-weight: 650; }
+QLabel#detailText { color: palette(text); }
+QLabel#pill { background: rgba(32, 184, 166, 14%); color: #147f78; border-radius: 999px;
+              padding: 6px 14px; font-weight: 600; }
+QLabel#emptyState { color: palette(placeholder-text); padding: 20px; }
+QPushButton { min-height: 34px; padding: 6px 16px; border-radius: 8px;
+              border: 1px solid palette(midlight); background: palette(button); }
+QPushButton:hover { border-color: #20b8a6; }
+QPushButton#primaryButton { background: #147f78; color: #ffffff; border: 1px solid #147f78;
+                            font-weight: 600; padding: 8px 20px; }
+QPushButton#primaryButton:hover { background: #106c66; }
+QPushButton#primaryButton:disabled { background: palette(mid); color: palette(placeholder-text);
+                                     border-color: palette(mid); }
+QProgressBar { border: 0; border-radius: 6px; background: palette(midlight); max-height: 6px;
+               min-height: 6px; text-align: center; color: transparent; }
+QProgressBar::chunk { background: #20b8a6; border-radius: 6px; }
+QMenuBar, QStatusBar { background: transparent; }
+"""
+
+
+def _system_prefers_dark() -> bool:
+    """跟随桌面深色模式 —— 读 freedesktop color-scheme portal(1=深色)。
+
+    与 linxira-welcome 同源: Qt 在 COSMIC 下没有平台主题插件, 读不到桌面主题, 只能查 portal。
+    """
+    try:
+        result = subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.freedesktop.portal.Desktop",
+             "--object-path", "/org/freedesktop/portal/desktop",
+             "--method", "org.freedesktop.portal.Settings.ReadOne",
+             "org.freedesktop.appearance", "color-scheme"],
+            capture_output=True, text=True, timeout=3, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "uint32 1" in result.stdout
+
+
+def _apply_dark_palette(app: QApplication) -> None:
+    """Fusion + 深色调色板(高亮用品牌青 #20b8a6)；与 welcome 同一套色值。"""
+    app.setStyle("Fusion")
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#2a2e32"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#e6eaed"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#1f2326"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#2a2e32"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#e6eaed"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#2a2e32"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e6eaed"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1f2326"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#e6eaed"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#20b8a6"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#4fc3f7"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#9aa6a8"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#6b7478"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#6b7478"))
+    app.setPalette(palette)
+
+
+def apply_theme(application: QApplication) -> None:
+    """应用 Linxira 视觉基准（Fusion + 深色跟随 + 全局 QSS）。"""
+    application.setStyle("Fusion")
+    if _system_prefers_dark():
+        _apply_dark_palette(application)
+    application.setStyleSheet(THEME_QSS)
+    icon = QIcon.fromTheme("system-software-install")
+    if not icon.isNull():
+        application.setWindowIcon(icon)
 
 
 def show_about(parent: QWidget | None = None) -> QDialog:
@@ -702,57 +801,97 @@ class PackageCenterWindow(QMainWindow):
         self.menuBar().addMenu("Help").addAction(about)
         central = QWidget()
         root = QVBoxLayout(central)
-        root.setContentsMargins(22, 18, 22, 18)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(14)
         self.setCentralWidget(central)
 
+        # 顶部 hero 卡: 标题 + 说明 + 过滤器（取代原先的裸标题 + 裸工具条）
+        hero = QFrame()
+        hero.setObjectName("heroCard")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(20, 16, 20, 16)
+        hero_layout.setSpacing(18)
+        hero_copy = QVBoxLayout()
+        hero_copy.setSpacing(4)
         heading = QLabel("官方推荐软件")
-        heading.setFont(QFont(heading.font().family(), 20, QFont.Weight.DemiBold))
-        root.addWidget(heading)
-        root.addWidget(QLabel("从经过审核的软件目录中选择应用。展开类别可查看和调整每个项目。"))
+        heading.setObjectName("heroTitle")
+        subtitle = QLabel("从经过审核的软件目录中选择应用。展开类别可查看和调整每个项目。")
+        subtitle.setObjectName("heroSubtitle")
+        subtitle.setWordWrap(True)
+        hero_copy.addWidget(heading)
+        hero_copy.addWidget(subtitle)
+        hero_layout.addLayout(hero_copy, 1)
 
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("显示："))
+        filter_column = QVBoxLayout()
+        filter_column.setSpacing(4)
+        filter_label = QLabel("显示")
+        filter_label.setObjectName("heroSubtitle")
         self.filter_box = QComboBox()
+        self.filter_box.setObjectName("filterBox")
         self.filter_box.addItem("已审核且可安装", "default")
         self.filter_box.addItem("镜像自带（离线可装）", "offline")
         self.filter_box.addItem("需联网", "online")
         self.filter_box.addItem("已安装", "installed")
         self.filter_box.addItem("第三方审核频道（仅查看，需 opt-in）", "review")
         self.filter_box.currentIndexChanged.connect(self.apply_filter)
-        toolbar.addWidget(self.filter_box)
-        toolbar.addStretch()
-        root.addLayout(toolbar)
+        filter_column.addWidget(filter_label)
+        filter_column.addWidget(self.filter_box)
+        hero_layout.addLayout(filter_column)
+        root.addWidget(hero)
 
         splitter = QSplitter()
         self.tree = QTreeWidget()
+        self.tree.setObjectName("softwareTree")
         self.tree.setHeaderLabels(["软件", "状态"])
         self.tree.setColumnWidth(0, 390)
-        self.tree.setAlternatingRowColors(True)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setIndentation(18)
+        self.tree.setAnimated(True)
         self.tree.setAccessibleName("官方推荐软件选择树")
         self.tree.itemChanged.connect(self.on_item_changed)
         self.tree.currentItemChanged.connect(self.show_details)
-        splitter.addWidget(self.tree)
+        self.empty_state = QLabel("没有符合当前筛选条件的软件")
+        self.empty_state.setObjectName("emptyState")
+        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state.setVisible(False)
+        tree_column = QWidget()
+        tree_column_layout = QVBoxLayout(tree_column)
+        tree_column_layout.setContentsMargins(0, 0, 0, 0)
+        tree_column_layout.setSpacing(8)
+        tree_column_layout.addWidget(self.tree, 1)
+        tree_column_layout.addWidget(self.empty_state)
+        splitter.addWidget(tree_column)
 
         detail_frame = QFrame()
-        detail_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        detail_frame.setObjectName("detailCard")
         detail_layout = QVBoxLayout(detail_frame)
+        detail_layout.setContentsMargins(18, 16, 18, 16)
+        detail_layout.setSpacing(8)
         self.detail_title = QLabel("选择一个软件")
-        self.detail_title.setFont(QFont(self.detail_title.font().family(), 14, QFont.Weight.DemiBold))
+        self.detail_title.setObjectName("detailTitle")
         self.detail_text = QLabel("展开左侧类别并选择软件以查看说明。")
+        self.detail_text.setObjectName("detailText")
         self.detail_text.setWordWrap(True)
+        self.detail_text.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
         self.detail_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         detail_layout.addWidget(self.detail_title)
         detail_layout.addWidget(self.detail_text)
         detail_layout.addStretch()
         splitter.addWidget(detail_frame)
-        splitter.setSizes([590, 330])
+        splitter.setSizes([600, 340])
         root.addWidget(splitter, 1)
 
         footer = QHBoxLayout()
+        footer.setSpacing(12)
         self.selection_label = QLabel()
+        self.selection_label.setObjectName("pill")
         footer.addWidget(self.selection_label)
         footer.addStretch()
         self.install_button = QPushButton("安装所选软件")
+        self.install_button.setObjectName("primaryButton")
         self.install_button.clicked.connect(self.install_selected)
         footer.addWidget(self.install_button)
         root.addLayout(footer)
@@ -772,6 +911,13 @@ class PackageCenterWindow(QMainWindow):
             for category in self.categories:
                 parent = QTreeWidgetItem(self.tree, [category.name, self.policy_text(category)])
                 parent.setData(0, CATEGORY_ROLE, category.id)
+                parent.setSizeHint(0, QSize(0, 34))
+                parent_font = parent.font(0)
+                parent_font.setBold(True)
+                parent.setFont(0, parent_font)
+                parent.setForeground(
+                    1, QBrush(self.palette().color(QPalette.ColorRole.PlaceholderText))
+                )
                 parent.setFlags(parent.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 self.category_items[category.id] = parent
                 for application in category.applications:
@@ -787,6 +933,22 @@ class PackageCenterWindow(QMainWindow):
                             status += f" · {application.offline_label}"
                     item = QTreeWidgetItem(parent, [application.name, status])
                     item.setData(0, APP_ROLE, application.id)
+                    # 视觉层(2026-10-14): 行高/字重/状态语义色 —— 只加样式, 文案一字不改
+                    item.setSizeHint(0, QSize(0, 34))
+                    name_font = item.font(0)
+                    name_font.setBold(application.installed or application.recommended)
+                    item.setFont(0, name_font)
+                    if application.installed:
+                        colour = SUCCESS
+                    elif application.installed_state == "partial":
+                        colour = WARNING
+                    elif application.channel == "optional-review":
+                        colour = WARNING
+                    elif application.recommended:
+                        colour = ACCENT_STRONG
+                    else:
+                        colour = self.palette().color(QPalette.ColorRole.PlaceholderText).name()
+                    item.setForeground(1, QBrush(QColor(colour)))
                     if application.installed:
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
                         state = Qt.CheckState.Checked
@@ -955,6 +1117,9 @@ class PackageCenterWindow(QMainWindow):
                 self.application_items[application.id].setHidden(hidden)
                 visible = visible or not hidden
             parent.setHidden(not visible)
+        self.empty_state.setVisible(
+            not any(not item.isHidden() for item in self.application_items.values())
+        )
 
     def show_details(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
         if current is None:
@@ -1070,6 +1235,7 @@ class PackageCenterWindow(QMainWindow):
 
 def main() -> int:
     application = QApplication(sys.argv)
+    apply_theme(application)
     application.setApplicationName("Quick System Software Setup")
     application.setOrganizationName("Linxira")
     catalog_path = Path(os.environ.get("LINXIRA_CATALOG_PATH", DEFAULT_CATALOG_PATH))
