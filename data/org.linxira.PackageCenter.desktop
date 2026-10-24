@@ -5,6 +5,6 @@ Name[zh_CN]=快速配置系统软件
 Comment=Configure reviewed Linxira applications
 Comment[zh_CN]=配置经过审核的 Linxira 应用
 Exec=/usr/bin/linxira-package-center
-Icon=system-software-install
+Icon=linxira-package-center
 Terminal=false
 Categories=System;Settings;

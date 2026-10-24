@@ -146,7 +146,7 @@ def apply_theme(application: QApplication) -> None:
     if _system_prefers_dark():
         _apply_dark_palette(application)
     application.setStyleSheet(THEME_QSS)
-    icon = QIcon.fromTheme("system-software-install")
+    icon = QIcon.fromTheme("linxira-package-center")
     if not icon.isNull():
         application.setWindowIcon(icon)
 
